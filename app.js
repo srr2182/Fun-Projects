@@ -304,6 +304,8 @@ function inpaintRegion(imageData, w, h, boxX, boxY, boxW, boxH, iterations = 120
 
 function clamp(v, min, max) { return Math.max(min, Math.min(max, v)); }
 
+function photoSrc(p) { return p.processedCanvas ? p.processedCanvas.toDataURL() : p.img.src;}
+
 function App() {
   const [apiKey, setApiKey] = useState(() => localStorage.getItem(API_KEY_STORAGE) || "");
   const [showSettings, setShowSettings] = useState(false);
@@ -571,7 +573,7 @@ function App() {
                 <div style={{ fontSize: 14, fontWeight: 600, marginBottom: 8 }}>{g.label} · {g.photoIds.length} photo(s)</div>
                 <div style={{ display: "flex", gap: 6, marginBottom: 10, flexWrap: "wrap" }}>
                   {photos.filter((p) => g.photoIds.includes(p.id)).slice(0, 6).map((p) => (
-                    <img key={p.id} src={(p.processedCanvas || p.img).toDataURL()} alt=""
+                    <img key={p.id} src={photoSrc(p)} alt=""
                       style={{ width: 60, height: 60, objectFit: "cover", borderRadius: 6 }} />
                   ))}
                 </div>
@@ -596,7 +598,7 @@ function App() {
               {photos.map((p) => (
                 <div key={p.id} style={{ padding: 12, background: "#232323", borderRadius: 10 }}>
                   <div style={{ display: "flex", gap: 12 }}>
-                    <img src={(p.processedCanvas || p.img).toDataURL()} alt="" style={{ width: 90, height: 90, objectFit: "cover", borderRadius: 8, flexShrink: 0 }} />
+                    <img src={photoSrc(p)} alt="" style={{ width: 90, height: 90, objectFit: "cover", borderRadius: 8, flexShrink: 0 }} />
                     <div style={{ flex: 1, minWidth: 0 }}>
                       <div style={{ fontSize: 12, marginBottom: 8, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{p.name}</div>
                       <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
