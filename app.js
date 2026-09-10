@@ -33,6 +33,11 @@ Do NOT flag: people, animals, or objects that are part of the scene; background 
 
 Respond with ONLY a JSON array, no prose, no markdown fences. Each item: {"label": short description, "category": one of "strap","sleep_line","blemish","stray_hair","dust_spot","stain","other_minor", "box": [x, y, w, h] as fractions of image width/height (0 to 1), "confidence": 0 to 1}. If nothing qualifies, return [].`;
 
+const GEOMETRY_PROMPT = `You are a professional photo editor suggesting straightening and cropping only — nothing else. Look at this photo and suggest a small straighten angle and crop insets that improve composition (level a tilted horizon, tighten framing, remove dead space) while keeping every person, animal, and major subject fully inside the frame. If the photo is already well composed, suggest little or no change.
+
+Respond with ONLY JSON, no prose, no markdown fences:
+{"rotationDeg": -10 to 10, "cropTopPct": 0 to 20, "cropBottomPct": 0 to 20, "cropLeftPct": 0 to 20, "cropRightPct": 0 to 20}`;
+
 function loadImage(src) {
   return new Promise((resolve) => {
     const img = new Image();
@@ -303,8 +308,161 @@ function inpaintRegion(imageData, w, h, boxX, boxY, boxW, boxH, iterations = 120
 }
 
 function clamp(v, min, max) { return Math.max(min, Math.min(max, v)); }
+function photoSrc(p) { return p.processedCanvas ? p.processedCanvas.toDataURL() : p.img.src; }
 
-function photoSrc(p) { return p.processedCanvas ? p.processedCanvas.toDataURL() : p.img.src;}
+function defaultGeometry() {
+  return { rotate90: 0, flipH: false, straighten: 0, cropTop: 0, cropBottom: 0, cropLeft: 0, cropRight: 0 };
+}
+
+// geometry only: 90-degree turns, horizontal flip, small straighten angle, edge crop insets.
+// this never touches pixel content, only which pixels are kept and how the frame is oriented.
+function applyGeometry(source, geo) {
+  const srcW = source.width, srcH = source.height;
+  let w = srcW, h = srcH;
+  if (geo.rotate90 % 2 !== 0) { w = srcH; h = srcW; }
+  const c1 = document.createElement("canvas");
+  c1.width = w; c1.height = h;
+  const ctx1 = c1.getContext("2d");
+  ctx1.save();
+  ctx1.translate(w / 2, h / 2);
+  ctx1.rotate((geo.rotate90 * 90 * Math.PI) / 180);
+  if (geo.flipH) ctx1.scale(-1, 1);
+  ctx1.drawImage(source, -srcW / 2, -srcH / 2);
+  ctx1.restore();
+
+  let c2 = c1;
+  if (geo.straighten) {
+    const rad = (geo.straighten * Math.PI) / 180;
+    const overscale = 1 + Math.min(0.35, (Math.abs(geo.straighten) / 10) * 0.15);
+    const tmp = document.createElement("canvas");
+    tmp.width = c1.width; tmp.height = c1.height;
+    const tctx = tmp.getContext("2d");
+    tctx.save();
+    tctx.translate(c1.width / 2, c1.height / 2);
+    tctx.rotate(rad);
+    tctx.scale(overscale, overscale);
+    tctx.drawImage(c1, -c1.width / 2, -c1.height / 2);
+    tctx.restore();
+    c2 = tmp;
+  }
+
+  const cw = c2.width, ch = c2.height;
+  const left = Math.round(cw * ((geo.cropLeft || 0) / 100));
+  const right = Math.round(cw * ((geo.cropRight || 0) / 100));
+  const top = Math.round(ch * ((geo.cropTop || 0) / 100));
+  const bottom = Math.round(ch * ((geo.cropBottom || 0) / 100));
+  const outW = Math.max(1, cw - left - right), outH = Math.max(1, ch - top - bottom);
+  const c3 = document.createElement("canvas");
+  c3.width = outW; c3.height = outH;
+  c3.getContext("2d").drawImage(c2, left, top, outW, outH, 0, 0, outW, outH);
+  return c3;
+}
+
+// --- minimal zip writer (store/no compression) so "download all" needs no external library ---
+const CRC_TABLE = (() => {
+  const table = [];
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    table[n] = c;
+  }
+  return table;
+})();
+function crc32(buf) {
+  let crc = 0 ^ -1;
+  for (let i = 0; i < buf.length; i++) crc = (crc >>> 8) ^ CRC_TABLE[(crc ^ buf[i]) & 0xff];
+  return (crc ^ -1) >>> 0;
+}
+function dataUrlToUint8Array(dataUrl) {
+  const binary = atob(dataUrl.split(",")[1]);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+function createZip(files) {
+  const encoder = new TextEncoder();
+  const localParts = [], centralParts = [];
+  let offset = 0;
+  const now = new Date();
+  const dosTime = ((now.getHours() << 11) | (now.getMinutes() << 5) | (now.getSeconds() / 2)) & 0xffff;
+  const dosDate = (((now.getFullYear() - 1980) << 9) | ((now.getMonth() + 1) << 5) | now.getDate()) & 0xffff;
+
+  files.forEach((f) => {
+    const nameBytes = encoder.encode(f.name);
+    const data = f.data;
+    const crc = crc32(data);
+    const localHeader = new Uint8Array(30 + nameBytes.length);
+    const dv = new DataView(localHeader.buffer);
+    dv.setUint32(0, 0x04034b50, true);
+    dv.setUint16(4, 20, true);
+    dv.setUint16(6, 0, true);
+    dv.setUint16(8, 0, true);
+    dv.setUint16(10, dosTime, true);
+    dv.setUint16(12, dosDate, true);
+    dv.setUint32(14, crc, true);
+    dv.setUint32(18, data.length, true);
+    dv.setUint32(22, data.length, true);
+    dv.setUint16(26, nameBytes.length, true);
+    dv.setUint16(28, 0, true);
+    localHeader.set(nameBytes, 30);
+    localParts.push(localHeader, data);
+
+    const centralHeader = new Uint8Array(46 + nameBytes.length);
+    const cdv = new DataView(centralHeader.buffer);
+    cdv.setUint32(0, 0x02014b50, true);
+    cdv.setUint16(4, 20, true);
+    cdv.setUint16(6, 20, true);
+    cdv.setUint16(8, 0, true);
+    cdv.setUint16(10, 0, true);
+    cdv.setUint16(12, dosTime, true);
+    cdv.setUint16(14, dosDate, true);
+    cdv.setUint32(16, crc, true);
+    cdv.setUint32(20, data.length, true);
+    cdv.setUint32(24, data.length, true);
+    cdv.setUint16(28, nameBytes.length, true);
+    cdv.setUint16(30, 0, true);
+    cdv.setUint16(32, 0, true);
+    cdv.setUint16(34, 0, true);
+    cdv.setUint16(36, 0, true);
+    cdv.setUint32(38, 0, true);
+    cdv.setUint32(42, offset, true);
+    centralHeader.set(nameBytes, 46);
+    centralParts.push(centralHeader);
+
+    offset += localHeader.length + data.length;
+  });
+
+  const centralSize = centralParts.reduce((s, p) => s + p.length, 0);
+  const centralOffset = offset;
+  const eocd = new Uint8Array(22);
+  const edv = new DataView(eocd.buffer);
+  edv.setUint32(0, 0x06054b50, true);
+  edv.setUint16(8, files.length, true);
+  edv.setUint16(10, files.length, true);
+  edv.setUint32(12, centralSize, true);
+  edv.setUint32(16, centralOffset, true);
+
+  return new Blob([...localParts, ...centralParts, eocd], { type: "application/zip" });
+}
+
+function downscaleToCanvas(img, maxDim) {
+  const scale = Math.min(1, maxDim / Math.max(img.width, img.height));
+  const w = Math.round(img.width * scale), h = Math.round(img.height * scale);
+  const c = document.createElement("canvas");
+  c.width = w; c.height = h;
+  c.getContext("2d").drawImage(img, 0, 0, w, h);
+  return c;
+}
+
+function getRepresentativePhoto(group, photos) {
+  return photos.find((p) => group.photoIds.includes(p.id));
+}
+function computeGroupPreviewCanvas(group, photos) {
+  const rep = getRepresentativePhoto(group, photos);
+  if (!rep || !rep.previewCanvas) return null;
+  const geo = applyGeometry(rep.previewCanvas, group.geometry);
+  return applyGrade(geo, group.settings);
+}
 
 function App() {
   const [apiKey, setApiKey] = useState(() => localStorage.getItem(API_KEY_STORAGE) || "");
@@ -369,7 +527,7 @@ function App() {
       const dataUrl = await fileToDataUrl(file);
       const img = await loadImage(dataUrl);
       const lighting = measureLighting(img);
-      loaded.push({ id: nextId++, name: file.name, img, lighting, processedCanvas: null, groupId: null });
+      loaded.push({ id: nextId++, name: file.name, img, previewCanvas: downscaleToCanvas(img, 700), lighting, processedCanvas: null, groupId: null });
     }
     setPhotos((prev) => [...prev, ...loaded]);
     setStatus(`${loaded.length} photo(s) loaded.`);
@@ -406,7 +564,7 @@ function App() {
         grain: referenceProfile.grain,
         vignette: referenceProfile.vignette,
       };
-      newGroups.push({ id: nextId++, label: labelForCluster(avgLum, avgWarmth), photoIds: memberIdx.map((i) => photos[i].id), settings, approved: false });
+      newGroups.push({ id: nextId++, label: labelForCluster(avgLum, avgWarmth), photoIds: memberIdx.map((i) => photos[i].id), settings, geometry: defaultGeometry(), approved: false });
     }
     setGroups(newGroups);
     setStep("review");
@@ -415,16 +573,38 @@ function App() {
   const updateGroupSetting = (groupId, key, value) => {
     setGroups((prev) => prev.map((g) => (g.id === groupId ? { ...g, settings: { ...g.settings, [key]: value } } : g)));
   };
+  const updateGroupGeometry = (groupId, key, value) => {
+    setGroups((prev) => prev.map((g) => (g.id === groupId ? { ...g, geometry: { ...g.geometry, [key]: value } } : g)));
+  };
+
+  const suggestGeometry = needsKeyNotice(async (groupId) => {
+    const group = groups.find((g) => g.id === groupId);
+    if (!group) return;
+    const repPhoto = photos.find((p) => p.id === group.photoIds[0]);
+    if (!repPhoto) return;
+    setStatus("Checking composition...");
+    try {
+      const dataUrl = downscaleToDataUrl(repPhoto.img, 1024);
+      const r = await callClaudeVision(apiKey, GEOMETRY_PROMPT, [dataUrl]);
+      setGroups((prev) => prev.map((g) => g.id === groupId ? {
+        ...g, geometry: { ...g.geometry, straighten: r.rotationDeg || 0,
+          cropTop: r.cropTopPct || 0, cropBottom: r.cropBottomPct || 0,
+          cropLeft: r.cropLeftPct || 0, cropRight: r.cropRightPct || 0 },
+      } : g));
+      setStatus("Composition suggestion applied to the sliders — review before applying.");
+    } catch (err) {
+      setStatus("Couldn't get a composition suggestion: " + (err.message || "error"));
+    }
+    setTimeout(() => setStatus(""), 3000);
+  });
 
   const applyGroup = (groupId) => {
     const group = groups.find((g) => g.id === groupId);
     if (!group) return;
     setPhotos((prev) => prev.map((p) => {
       if (!group.photoIds.includes(p.id)) return p;
-      const srcCanvas = document.createElement("canvas");
-      srcCanvas.width = p.img.width; srcCanvas.height = p.img.height;
-      srcCanvas.getContext("2d").drawImage(p.img, 0, 0);
-      const processed = applyGrade(srcCanvas, group.settings);
+      const geoCanvas = applyGeometry(p.img, group.geometry);
+      const processed = applyGrade(geoCanvas, group.settings);
       return { ...p, processedCanvas: processed, groupId: group.id };
     }));
     setGroups((prev) => prev.map((g) => (g.id === groupId ? { ...g, approved: true } : g)));
@@ -480,9 +660,37 @@ function App() {
     const canvas = photo.processedCanvas;
     if (!canvas) return;
     const a = document.createElement("a");
-    a.href = canvas.toDataURL("image/png");
-    a.download = `edited-${photo.name.replace(/\.[^.]+$/, "")}.png`;
+    a.href = canvas.toDataURL("image/jpeg", 0.92);
+    a.download = `edited-${photo.name.replace(/\.[^.]+$/, "")}.jpg`;
     a.click();
+  };
+
+  const [zipping, setZipping] = useState(false);
+  const downloadAllZip = () => {
+    const ready = photos.filter((p) => p.processedCanvas);
+    if (ready.length === 0) return;
+    setZipping(true);
+    setStatus(`Zipping ${ready.length} photo(s)...`);
+    setTimeout(() => {
+      try {
+        const files = ready.map((p) => ({
+          name: `edited-${p.name.replace(/\.[^.]+$/, "")}.jpg`,
+          data: dataUrlToUint8Array(p.processedCanvas.toDataURL("image/jpeg", 0.92)),
+        }));
+        const blob = createZip(files);
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = "edited-photos.zip";
+        a.click();
+        URL.revokeObjectURL(url);
+        setStatus("Zip downloaded.");
+      } catch (err) {
+        setStatus("Couldn't build the zip: " + (err.message || "error"));
+      }
+      setZipping(false);
+      setTimeout(() => setStatus(""), 2500);
+    }, 30);
   };
 
   const allApproved = groups.length > 0 && groups.every((g) => g.approved);
@@ -567,22 +775,42 @@ function App() {
 
         {step === "review" && (
           <div>
-            {groups.map((g) => (
+            {groups.map((g) => {
+              const previewCanvas = computeGroupPreviewCanvas(g, photos);
+              return (
               <div key={g.id} style={{ marginBottom: 18, padding: 14, background: "#232323", borderRadius: 10,
                 border: g.approved ? "1px solid #5c8a5c" : "1px solid #3a3a3a" }}>
                 <div style={{ fontSize: 14, fontWeight: 600, marginBottom: 8 }}>{g.label} · {g.photoIds.length} photo(s)</div>
-                <div style={{ display: "flex", gap: 6, marginBottom: 10, flexWrap: "wrap" }}>
-                  {photos.filter((p) => g.photoIds.includes(p.id)).slice(0, 6).map((p) => (
-                    <img key={p.id} src={photoSrc(p)} alt=""
-                      style={{ width: 60, height: 60, objectFit: "cover", borderRadius: 6 }} />
+                {previewCanvas && (
+                  <img src={previewCanvas.toDataURL()} alt="" style={{ width: "100%", borderRadius: 8, marginBottom: 12, display: "block" }} />
+                )}
+                <div style={{ fontSize: 11, color: "#6b675f", marginBottom: 10 }}>
+                  Preview shown at reduced resolution for responsiveness — "Apply" processes every photo in this group at full resolution.
+                </div>
+                <div style={{ marginBottom: 10 }}>
+                  <div style={{ fontSize: 12, fontWeight: 600, color: "#b0aca2", marginBottom: 6 }}>Geometry (crop, rotate, straighten)</div>
+                  <div style={{ display: "flex", gap: 6, marginBottom: 8 }}>
+                    <button onClick={() => updateGroupGeometry(g.id, "rotate90", (g.geometry.rotate90 + 3) % 4)} style={{ ...btnStyle(false), flex: 1, fontSize: 11, padding: "6px 4px" }}>⟲ Rotate</button>
+                    <button onClick={() => updateGroupGeometry(g.id, "rotate90", (g.geometry.rotate90 + 1) % 4)} style={{ ...btnStyle(false), flex: 1, fontSize: 11, padding: "6px 4px" }}>⟳ Rotate</button>
+                    <button onClick={() => updateGroupGeometry(g.id, "flipH", !g.geometry.flipH)} style={{ ...btnStyle(g.geometry.flipH), flex: 1, fontSize: 11, padding: "6px 4px" }}>Flip</button>
+                  </div>
+                  <button onClick={() => suggestGeometry(g.id)} style={{ ...btnStyle(false), width: "100%", fontSize: 11, padding: "6px 4px", marginBottom: 8 }}>Auto-suggest straighten & crop</button>
+                  <label style={labelStyle}>Straighten <span style={monoStyle}>{g.geometry.straighten}°</span></label>
+                  <input type="range" min="-10" max="10" value={g.geometry.straighten} onChange={(e) => updateGroupGeometry(g.id, "straighten", Number(e.target.value))} style={{ width: "100%", marginBottom: 6 }} />
+                  {["cropTop", "cropBottom", "cropLeft", "cropRight"].map((k) => (
+                    <div key={k}>
+                      <label style={labelStyle}>{{ cropTop: "Crop top", cropBottom: "Crop bottom", cropLeft: "Crop left", cropRight: "Crop right" }[k]} <span style={monoStyle}>{g.geometry[k]}%</span></label>
+                      <input type="range" min="0" max="30" value={g.geometry[k]} onChange={(e) => updateGroupGeometry(g.id, k, Number(e.target.value))} style={{ width: "100%", marginBottom: 6 }} />
+                    </div>
                   ))}
                 </div>
                 <ProfileGrid settings={g.settings} onChange={(k, v) => updateGroupSetting(g.id, k, v)} />
                 <button onClick={() => applyGroup(g.id)} style={{ ...btnStyle(g.approved), width: "100%", marginTop: 10 }}>
-                  {g.approved ? "Re-apply" : "Apply to group"}
+                  {g.approved ? `Re-apply to all ${g.photoIds.length} photos` : `Apply to all ${g.photoIds.length} photos`}
                 </button>
               </div>
-            ))}
+              );
+            })}
             {allApproved && (
               <button onClick={() => setStep("cleanup")} style={{ ...btnStyle(true), width: "100%" }}>Continue to optional cleanup</button>
             )}
@@ -594,6 +822,10 @@ function App() {
             <div style={{ fontSize: 12, color: "#c9a15c", marginBottom: 14, lineHeight: 1.5 }}>
               Separate from grading above — this can remove small things like a bra strap or sleep line, only where you approve it.
             </div>
+            <button onClick={downloadAllZip} disabled={zipping || photos.every((p) => !p.processedCanvas)}
+              style={{ ...btnStyle(true, zipping || photos.every((p) => !p.processedCanvas)), width: "100%", marginBottom: 14 }}>
+              {zipping ? "Zipping..." : "Download all as ZIP"}
+            </button>
             <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
               {photos.map((p) => (
                 <div key={p.id} style={{ padding: 12, background: "#232323", borderRadius: 10 }}>
